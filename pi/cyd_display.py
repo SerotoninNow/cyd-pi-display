@@ -530,7 +530,10 @@ def reader(port, ack, touch):
                     x, y, p = (int(v) for v in line.split()[1:4])
                 except ValueError:
                     continue
-                touch.event(x, y, bool(p))
+                try:
+                    touch.event(x, y, bool(p))
+                except Exception as err:  # a failed touch must not stop the link
+                    print(f"touch: {err!r}", file=sys.stderr)
     except (serial.SerialException, OSError, TypeError):
         ack.set()  # port went away; unblock the sender so it can reconnect
 

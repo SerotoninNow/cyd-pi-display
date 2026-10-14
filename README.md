@@ -57,6 +57,9 @@ blue frame around the panel) until you press it again. Change the combination wi
 This reads keyboards directly, so your user must be in the `input` group (it is by default on
 Raspberry Pi OS; elsewhere `sudo usermod -aG input $USER`, then log out and back in).
 
+For a Spotify "now playing" screen with touch controls, see
+[cyd-spotify](https://github.com/SerotoninNow/cyd-spotify); it uses the same firmware.
+
 ### Mirroring
 
 Without `--source`, the main screen is mirrored. The capture method is chosen automatically:
