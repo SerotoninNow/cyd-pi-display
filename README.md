@@ -31,8 +31,30 @@ sudo apt install python3-serial python3-pil python3-evdev grim
 python3 pi/cyd_display.py --source test
 ```
 
-That shows a test pattern with a clock, which confirms the link. Then drop `--source test`
-to mirror the real screen. The capture method is chosen automatically:
+That shows a test pattern with a clock, which confirms the link.
+
+### Its own screen
+
+The CYD can show its own content instead of copying the main screen:
+
+```bash
+python3 pi/cyd_display.py --source dashboard
+```
+
+A live system dashboard: CPU, temperature, memory, disk, IP address, uptime and load.
+
+```bash
+python3 pi/cyd_display.py --source apps --run lxterminal
+```
+
+A separate, invisible 320x240 screen whose apps appear only on the CYD, at native size, with
+touch working as the mouse on that screen (your main pointer is unaffected). Each new window
+is sized to fill the panel. `--run` can be given several times; to start more apps later,
+set `DISPLAY=:5` for them. Needs `sudo apt install xvfb`.
+
+### Mirroring
+
+Without `--source`, the main screen is mirrored. The capture method is chosen automatically:
 
 | Pi setup | Method | Notes |
 | --- | --- | --- |
@@ -46,8 +68,11 @@ to `/dev/uinput`, simplest with `sudo`), `--stretch`, `--quality`, `--port`.
 
 ## Tuning
 
-- **Speed**: the link runs at 921600 baud. For more frames per second, change `LINK_BAUD` in
-  `firmware/platformio.ini` to `2000000`, reflash, and pass `--baud 2000000`.
+- **Speed**: only the part of the screen that changed is sent, so small changes (a clock, a
+  terminal line) update at around 40 per second and full-screen changes at around 14. The link
+  runs at 2 Mbaud; if frames get lost on your USB port, set `LINK_BAUD` in `firmware/platformio.ini`
+  to `921600`, reflash, and pass `--baud 921600`. When mirroring, screen capture is often the
+  limit instead (Spectacle on KDE manages about 4 per second).
 - **Colours inverted**: add `-DTFT_INVERSION_ON=1` to the build flags of your env.
 - **Touch lands off-target**: adjust the `TOUCH_*_MIN/MAX` values in `firmware/src/main.cpp`.
 - **Readable text**: the panel is only 320x240, so set the Pi to a low resolution

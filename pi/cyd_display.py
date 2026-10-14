@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-"""Mirror the Raspberry Pi screen onto an ESP32-2432S028 (CYD) over USB serial.
+"""Drive an ESP32-2432S028 (CYD) as a small USB display for a Raspberry Pi or Linux PC.
 
-Run this on the Pi with the CYD plugged into one of its USB ports:
+Run this with the CYD plugged into a USB port:
 
-    python3 cyd_display.py                 # auto-detect capture method
-    python3 cyd_display.py --touch         # also use the CYD as a touch pointer
-    python3 cyd_display.py --source test   # moving test pattern, no capture
+    python3 cyd_display.py --source dashboard              # system dashboard (CPU, temperature, memory...)
+    python3 cyd_display.py --source apps --run lxterminal  # a separate 320x240 screen for apps, with touch
+    python3 cyd_display.py                                 # mirror the main screen
+    python3 cyd_display.py --touch                         # mirror, and use the CYD as a touch pointer
+    python3 cyd_display.py --source test                   # moving test pattern
 
 See ../firmware/src/main.cpp for the link protocol.
 """
 import argparse
+import ctypes
+import ctypes.util
 import io
 import os
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
-import zlib
 
 import serial
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 W, H = 320, 240
-MAGIC = b"CYDF"
+TILE = 16  # partial updates are aligned to JPEG blocks so their edges don't show
 MAX_FRAME = 60000
 ACK_TIMEOUT = 1.5
 
@@ -96,7 +100,247 @@ class TestCapture:
         return img
 
 
-def make_capture(source, fbdev):
+def load_font(size, bold=False):
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    for folder in ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/TTF", "/usr/share/fonts/dejavu"):
+        try:
+            return ImageFont.truetype(os.path.join(folder, name), size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size)
+
+
+class DashboardCapture:
+    """Draws a live system dashboard at the panel's native size."""
+
+    BG, FG, DIM, TRACK = (12, 14, 20), (235, 238, 245), (140, 146, 160), (40, 44, 56)
+
+    def __init__(self):
+        self.big, self.font, self.small = load_font(26, True), load_font(15), load_font(12)
+        self.cpu_prev = self._cpu_times()
+        self.frame, self.updated = None, 0.0
+        self.thermal = self._find_thermal()
+
+    @staticmethod
+    def _cpu_times():
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        return sum(v), v[3] + v[4]  # total, idle + iowait
+
+    @staticmethod
+    def _find_thermal():
+        zones = sorted(p for p in os.listdir("/sys/class/thermal") if p.startswith("thermal_zone"))
+        preferred = ("cpu-thermal", "x86_pkg_temp", "k10temp", "coretemp")
+        for want in preferred:
+            for z in zones:
+                try:
+                    with open(f"/sys/class/thermal/{z}/type") as f:
+                        if f.read().strip() == want:
+                            return f"/sys/class/thermal/{z}/temp"
+                except OSError:
+                    pass
+        return f"/sys/class/thermal/{zones[0]}/temp" if zones else None
+
+    def _stats(self):
+        total, idle = self._cpu_times()
+        dt, di = total - self.cpu_prev[0], idle - self.cpu_prev[1]
+        self.cpu_prev = (total, idle)
+        cpu = 100.0 * (1 - di / dt) if dt else 0.0
+
+        temp = None
+        if self.thermal:
+            try:
+                with open(self.thermal) as f:
+                    temp = int(f.read()) / 1000
+            except OSError:
+                pass
+
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":")
+                mem[k] = int(v.split()[0]) * 1024
+        used = mem["MemTotal"] - mem["MemAvailable"]
+
+        st = os.statvfs("/")
+        disk_total = st.f_blocks * st.f_frsize
+        disk_used = disk_total - st.f_bavail * st.f_frsize
+
+        with open("/proc/uptime") as f:
+            up = int(float(f.read().split()[0]))
+        try:
+            # Picks the outgoing interface's address; a UDP connect sends nothing.
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sk:
+                sk.connect(("192.0.2.1", 9))
+                ip = sk.getsockname()[0]
+        except OSError:
+            ip = "offline"
+        return dict(cpu=cpu, temp=temp, mem=(used, mem["MemTotal"]), disk=(disk_used, disk_total),
+                    up=up, load=os.getloadavg()[0], ip=ip)
+
+    @staticmethod
+    def _level(frac):
+        return (80, 200, 120) if frac < 0.6 else (240, 180, 60) if frac < 0.85 else (235, 80, 80)
+
+    def _row(self, d, y, label, value, frac):
+        d.text((14, y), label, font=self.font, fill=self.DIM)
+        d.text((W - 14, y), value, font=self.font, fill=self.FG, anchor="ra")
+        frac = min(max(frac, 0.0), 1.0)
+        d.rounded_rectangle((14, y + 22, W - 14, y + 28), 3, fill=self.TRACK)
+        if frac > 0:
+            d.rounded_rectangle((14, y + 22, 14 + max(6, int((W - 28) * frac)), y + 28), 3, fill=self._level(frac))
+
+    def grab(self):
+        now = time.monotonic()
+        if self.frame is not None and now - self.updated < 1.0:
+            return self.frame
+        self.updated = now
+        s = self._stats()
+        img = Image.new("RGB", (W, H), self.BG)
+        d = ImageDraw.Draw(img)
+        clock = time.strftime("%H:%M")
+        name, room = socket.gethostname(), W - 28 - d.textlength(clock, font=self.big) - 12
+        while len(name) > 1 and d.textlength(name, font=self.big) > room:
+            name = name[:-2] + "\u2026"
+        d.text((14, 8), name, font=self.big, fill=self.FG)
+        d.text((W - 14, 8), clock, font=self.big, fill=self.FG, anchor="ra")
+        d.line((14, 46, W - 14, 46), fill=self.TRACK)
+
+        gb = 1024**3
+        self._row(d, 56, "CPU", f"{s['cpu']:.0f}%", s["cpu"] / 100)
+        if s["temp"] is not None:
+            self._row(d, 92, "Temperature", f"{s['temp']:.0f}\u00b0C", (s["temp"] - 30) / 55)
+        self._row(d, 128, "Memory", f"{s['mem'][0] / gb:.1f} / {s['mem'][1] / gb:.1f} GB", s["mem"][0] / s["mem"][1])
+        self._row(d, 164, "Disk", f"{s['disk'][0] / gb:.0f} / {s['disk'][1] / gb:.0f} GB", s["disk"][0] / s["disk"][1])
+
+        days, rem = divmod(s["up"], 86400)
+        uptime = (f"{days}d " if days else "") + f"{rem // 3600}h {rem % 3600 // 60}m"
+        d.text((14, 214), s["ip"], font=self.small, fill=self.DIM)
+        d.text((W - 14, 214), f"up {uptime}  load {s['load']:.2f}", font=self.small, fill=self.DIM, anchor="ra")
+        self.frame = img
+        return img
+
+
+class _XImage(ctypes.Structure):
+    _fields_ = [
+        ("width", ctypes.c_int), ("height", ctypes.c_int), ("xoffset", ctypes.c_int), ("format", ctypes.c_int),
+        ("data", ctypes.c_void_p), ("byte_order", ctypes.c_int), ("bitmap_unit", ctypes.c_int),
+        ("bitmap_bit_order", ctypes.c_int), ("bitmap_pad", ctypes.c_int), ("depth", ctypes.c_int),
+        ("bytes_per_line", ctypes.c_int), ("bits_per_pixel", ctypes.c_int),
+    ]  # trailing fields are never touched from Python
+
+
+class _XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int), ("y", ctypes.c_int), ("width", ctypes.c_int), ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int), ("depth", ctypes.c_int), ("visual", ctypes.c_void_p),
+        ("root", ctypes.c_ulong), ("class_", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int), ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong), ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int), ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int), ("screen", ctypes.c_void_p),
+    ]
+
+
+def _load_xlib():
+    x = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11") or "libX11.so.6")
+    vp, ul = ctypes.c_void_p, ctypes.c_ulong
+    x.XOpenDisplay.restype, x.XOpenDisplay.argtypes = vp, [ctypes.c_char_p]
+    x.XDefaultRootWindow.restype, x.XDefaultRootWindow.argtypes = ul, [vp]
+    x.XGetImage.restype = ctypes.POINTER(_XImage)
+    x.XGetImage.argtypes = [vp, ul, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ul, ctypes.c_int]
+    x.XDestroyImage.argtypes = [ctypes.POINTER(_XImage)]
+    x.XQueryTree.argtypes = [vp, ul, ctypes.POINTER(ul), ctypes.POINTER(ul), ctypes.POINTER(ctypes.POINTER(ul)),
+                             ctypes.POINTER(ctypes.c_uint)]
+    x.XGetWindowAttributes.argtypes = [vp, ul, ctypes.POINTER(_XWindowAttributes)]
+    x.XMoveResizeWindow.argtypes = [vp, ul, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+    x.XFree.argtypes = [vp]
+    x.XFlush.argtypes = [vp]
+    return x
+
+
+class AppsCapture:
+    """A separate, invisible 320x240 X screen (Xvfb) whose contents go to the CYD.
+
+    Apps started with --run (or with DISPLAY set to this screen) appear only on the
+    CYD. There is no window manager, so each new window is sized to fill the panel."""
+
+    def __init__(self, display, commands):
+        self.display = display
+        num = display.lstrip(":").split(".")[0]
+        if not os.path.exists(f"/tmp/.X11-unix/X{num}"):
+            if not shutil.which("Xvfb"):
+                raise SystemExit("Xvfb is needed for --source apps (Raspberry Pi OS: sudo apt install xvfb).")
+            self.server = subprocess.Popen(
+                ["Xvfb", display, "-screen", "0", f"{W}x{H}x24", "-nolisten", "tcp"], stderr=subprocess.DEVNULL
+            )
+            for _ in range(50):
+                if os.path.exists(f"/tmp/.X11-unix/X{num}"):
+                    break
+                time.sleep(0.1)
+        self.x = _load_xlib()
+        self.d = self.x.XOpenDisplay(display.encode())
+        if not self.d:
+            raise SystemExit(f"Can't open X display {display}.")
+        self.root = self.x.XDefaultRootWindow(self.d)
+        env = dict(os.environ, DISPLAY=display, GDK_BACKEND="x11", QT_QPA_PLATFORM="xcb")
+        env.pop("WAYLAND_DISPLAY", None)
+        for cmd in commands:
+            subprocess.Popen(cmd, shell=True, env=env, start_new_session=True)
+        print(f"apps screen: {display} (start more apps with DISPLAY={display})")
+
+    def _fit_windows(self):
+        x, ul = self.x, ctypes.c_ulong
+        root, parent, children, n = ul(), ul(), ctypes.POINTER(ul)(), ctypes.c_uint()
+        if not x.XQueryTree(self.d, self.root, ctypes.byref(root), ctypes.byref(parent), ctypes.byref(children),
+                            ctypes.byref(n)):
+            return
+        attrs = _XWindowAttributes()
+        for i in range(n.value):
+            w = children[i]
+            if x.XGetWindowAttributes(self.d, w, ctypes.byref(attrs)) and attrs.map_state == 2:  # IsViewable
+                big = attrs.width > W // 2 or attrs.height > H // 2
+                if big and not attrs.override_redirect and (attrs.x, attrs.y, attrs.width, attrs.height) != (0, 0, W, H):
+                    x.XMoveResizeWindow(self.d, w, 0, 0, W, H)
+        if children:
+            x.XFree(children)
+        x.XFlush(self.d)
+
+    def grab(self):
+        self._fit_windows()
+        img = self.x.XGetImage(self.d, self.root, 0, 0, W, H, 0xFFFFFFFF, 2)  # ZPixmap
+        if not img:
+            raise RuntimeError("XGetImage failed")
+        try:
+            xi = img.contents
+            data = ctypes.string_at(xi.data, xi.bytes_per_line * xi.height)
+            return Image.frombuffer("RGB", (W, H), data, "raw", "BGRX", xi.bytes_per_line, 1).copy()
+        finally:
+            self.x.XDestroyImage(img)
+
+
+class AppsTouch:
+    """Sends CYD touches to the apps screen as mouse clicks (XTest), leaving the main pointer alone."""
+
+    def __init__(self, display):
+        self.x = _load_xlib()
+        self.t = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+        self.t.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+        self.t.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.d = self.x.XOpenDisplay(display.encode())  # its own connection: this runs on the reader thread
+        self.box = (0, 0, W, H)
+        self.down = False
+
+    def event(self, x, y, pressed):
+        self.t.XTestFakeMotionEvent(self.d, -1, x, y, 0)
+        if pressed != self.down:
+            self.t.XTestFakeButtonEvent(self.d, 1, int(pressed), 0)
+            self.down = pressed
+        self.x.XFlush(self.d)
+
+
+def make_capture(source, fbdev, display=":5", commands=()):
     if source == "auto":
         wayland = os.environ.get("WAYLAND_DISPLAY")
         if wayland and "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "") and shutil.which("spectacle"):
@@ -116,6 +360,10 @@ def make_capture(source, fbdev):
         return X11Capture()
     if source == "test":
         return TestCapture()
+    if source == "dashboard":
+        return DashboardCapture()
+    if source == "apps":
+        return AppsCapture(display, commands)
     return FbCapture(fbdev)
 
 
@@ -186,24 +434,42 @@ def reader(port, ack, touch):
         ack.set()  # port went away; unblock the sender so it can reconnect
 
 
+def _with_length(data):
+    return struct.pack("<I", len(data)) + data
+
+
+def changed_area(frame, shown):
+    """The block-aligned box that differs from what's on the panel, or None."""
+    box = ImageChops.difference(frame, shown).getbbox()
+    if not box:
+        return None
+    x0, y0 = box[0] // TILE * TILE, box[1] // TILE * TILE
+    x1, y1 = min(W, -(-box[2] // TILE) * TILE), min(H, -(-box[3] // TILE) * TILE)
+    return x0, y0, x1, y1
+
+
 def stream(port, cap, touch, args):
     ack = threading.Event()
     threading.Thread(target=reader, args=(port, ack, touch), daemon=True).start()
     period = 1.0 / args.fps
-    shown = None  # checksum of the frame currently on the panel
+    shown = None  # the frame currently on the panel; None forces a full redraw
     while True:
         start = time.monotonic()
         frame, box = fit(cap.grab(), args.stretch)
         if touch:
             touch.box = box
-        digest = zlib.crc32(frame.tobytes())
-        if digest != shown:
-            data = encode(frame, args.quality)
+        area = (0, 0, W, H) if shown is None else changed_area(frame, shown)
+        if area:
+            x0, y0, x1, y1 = area
+            if (x1 - x0) * (y1 - y0) > W * H * 0.6:
+                packet = b"CYDF" + _with_length(encode(frame, args.quality))
+            else:
+                data = encode(frame.crop(area), args.quality)
+                packet = b"CYDR" + struct.pack("<HH", x0, y0) + _with_length(data)
             ack.clear()
-            port.write(MAGIC + struct.pack("<I", len(data)) + data)
-            # Unacked frames are simply sent again on the next pass.
-            if ack.wait(ACK_TIMEOUT):
-                shown = digest
+            port.write(packet)
+            # A lost frame leaves the panel in an unknown state, so the next one is a full redraw.
+            shown = frame if ack.wait(ACK_TIMEOUT) else None
         delay = period - (time.monotonic() - start)
         if delay > 0:
             time.sleep(delay)
@@ -212,17 +478,24 @@ def stream(port, cap, touch, args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", default="/dev/ttyUSB0")
-    ap.add_argument("--baud", type=int, default=921600, help="must match LINK_BAUD in platformio.ini")
-    ap.add_argument("--source", choices=("auto", "fb", "grim", "spectacle", "x11", "test"), default="auto")
+    ap.add_argument("--baud", type=int, default=2000000, help="must match LINK_BAUD in platformio.ini")
+    ap.add_argument(
+        "--source", choices=("auto", "dashboard", "apps", "fb", "grim", "spectacle", "x11", "test"), default="auto"
+    )
+    ap.add_argument("--run", action="append", default=[], metavar="CMD", help="with --source apps: start CMD on it")
+    ap.add_argument("--display", default=":5", help="with --source apps: X display number for the apps screen")
     ap.add_argument("--fbdev", default="/dev/fb0")
-    ap.add_argument("--fps", type=float, default=15, help="upper limit; the link usually caps it lower")
+    ap.add_argument("--fps", type=float, default=30, help="upper limit; the link usually caps it lower")
     ap.add_argument("--quality", type=int, default=70, help="JPEG quality 1-95")
     ap.add_argument("--stretch", action="store_true", help="fill the panel instead of letterboxing")
     ap.add_argument("--touch", action="store_true", help="expose the touchscreen as a pointer (needs /dev/uinput)")
     args = ap.parse_args()
 
-    cap = make_capture(args.source, args.fbdev)
-    touch = TouchPointer() if args.touch else None
+    cap = make_capture(args.source, args.fbdev, args.display, args.run)
+    if args.source == "apps":
+        touch = AppsTouch(args.display)
+    else:
+        touch = TouchPointer() if args.touch else None
 
     while True:
         try:
