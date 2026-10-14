@@ -16,7 +16,9 @@ import ctypes
 import ctypes.util
 import io
 import os
+import select
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -28,6 +30,7 @@ import serial
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 W, H = 320, 240
+_children = []  # processes to stop on exit
 TILE = 16  # partial updates are aligned to JPEG blocks so their edges don't show
 MAX_FRAME = 60000
 ACK_TIMEOUT = 1.5
@@ -271,10 +274,14 @@ class AppsCapture:
         num = display.lstrip(":").split(".")[0]
         if not os.path.exists(f"/tmp/.X11-unix/X{num}"):
             if not shutil.which("Xvfb"):
-                raise SystemExit("Xvfb is needed for --source apps (Raspberry Pi OS: sudo apt install xvfb).")
+                raise SystemExit(
+                    "Xvfb is needed for --source apps. Install it with 'sudo apt install xvfb' "
+                    "(Raspberry Pi OS, Debian) or 'sudo pacman -S xorg-server-xvfb' (Arch, CachyOS)."
+                )
             self.server = subprocess.Popen(
                 ["Xvfb", display, "-screen", "0", f"{W}x{H}x24", "-nolisten", "tcp"], stderr=subprocess.DEVNULL
             )
+            _children.append(self.server)
             for _ in range(50):
                 if os.path.exists(f"/tmp/.X11-unix/X{num}"):
                     break
@@ -307,6 +314,8 @@ class AppsCapture:
             x.XFree(children)
         x.XFlush(self.d)
 
+    keyboard_on = False  # set by KeyboardForwarder; shown as a coloured frame around the panel
+
     def grab(self):
         self._fit_windows()
         img = self.x.XGetImage(self.d, self.root, 0, 0, W, H, 0xFFFFFFFF, 2)  # ZPixmap
@@ -315,9 +324,12 @@ class AppsCapture:
         try:
             xi = img.contents
             data = ctypes.string_at(xi.data, xi.bytes_per_line * xi.height)
-            return Image.frombuffer("RGB", (W, H), data, "raw", "BGRX", xi.bytes_per_line, 1).copy()
+            frame = Image.frombuffer("RGB", (W, H), data, "raw", "BGRX", xi.bytes_per_line, 1).copy()
         finally:
             self.x.XDestroyImage(img)
+        if self.keyboard_on:
+            ImageDraw.Draw(frame).rectangle((0, 0, W - 1, H - 1), outline=(60, 160, 255), width=3)
+        return frame
 
 
 class AppsTouch:
@@ -338,6 +350,95 @@ class AppsTouch:
             self.t.XTestFakeButtonEvent(self.d, 1, int(pressed), 0)
             self.down = pressed
         self.x.XFlush(self.d)
+
+
+class KeyboardForwarder:
+    """Pressing the hotkey sends the keyboard to the apps screen instead of the desktop, until it
+    is pressed again. Reads keyboards directly (evdev), so it works under Wayland and X11 alike;
+    needs read access to /dev/input (the 'input' group)."""
+
+    MODIFIERS = {
+        "ctrl": ("KEY_LEFTCTRL", "KEY_RIGHTCTRL"),
+        "alt": ("KEY_LEFTALT", "KEY_RIGHTALT"),
+        "shift": ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"),
+        "super": ("KEY_LEFTMETA", "KEY_RIGHTMETA"),
+    }
+
+    def __init__(self, display, hotkey, capture):
+        import evdev
+        from evdev import ecodes
+
+        self.evdev, self.ecodes, self.capture = evdev, ecodes, capture
+        *mods, key = hotkey.lower().split("+")
+        try:
+            self.mod_groups = [{ecodes.ecodes[k] for k in self.MODIFIERS[m]} for m in mods]
+            self.key = ecodes.ecodes["KEY_" + key.upper()]
+        except KeyError:
+            raise SystemExit(f"Can't understand hotkey '{hotkey}'; use e.g. ctrl+alt+k.")
+        self.hotkey = hotkey
+
+        self.devices = []
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue
+            keys = dev.capabilities().get(ecodes.EV_KEY, [])
+            if ecodes.KEY_A in keys and ecodes.KEY_ENTER in keys:
+                self.devices.append(dev)
+        if not self.devices:
+            raise PermissionError
+
+        self.x = _load_xlib()
+        self.t = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+        self.t.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.d = self.x.XOpenDisplay(display.encode())
+        self.active = self.toggle_pending = False
+        self.pressed = set()
+        threading.Thread(target=self._run, daemon=True).start()
+        print(f"keyboard: press {hotkey} to type on the CYD, and again to return to the desktop")
+
+    def _is_hotkey(self, code):
+        return code == self.key and all(group & self.pressed for group in self.mod_groups)
+
+    def _apply_toggle(self):
+        # Only switched with every key up, so neither side is left with a key stuck down.
+        self.active = not self.active
+        for dev in list(self.devices):
+            try:
+                dev.grab() if self.active else dev.ungrab()
+            except OSError:
+                pass
+        self.capture.keyboard_on = self.active
+        print(f"keyboard: {'on the CYD' if self.active else 'back on the desktop'}")
+
+    def _run(self):
+        ecodes = self.ecodes
+        while self.devices:
+            ready, _, _ = select.select(self.devices, [], [])
+            for dev in ready:
+                try:
+                    events = list(dev.read())
+                except OSError:  # unplugged
+                    self.devices.remove(dev)
+                    continue
+                for ev in events:
+                    if ev.type != ecodes.EV_KEY:
+                        continue
+                    if ev.value == 1:
+                        self.pressed.add(ev.code)
+                    elif ev.value == 0:
+                        self.pressed.discard(ev.code)
+                    hot = ev.code == self.key and (self.toggle_pending or self._is_hotkey(ev.code))
+                    if ev.value == 1 and hot:
+                        self.toggle_pending = True
+                    elif self.active and not hot:
+                        # X keycodes are evdev codes + 8; autorepeat (value 2) is sent as another press.
+                        self.t.XTestFakeKeyEvent(self.d, ev.code + 8, int(ev.value != 0), 0)
+                        self.x.XFlush(self.d)
+                    if self.toggle_pending and not self.pressed:
+                        self.toggle_pending = False
+                        self._apply_toggle()
 
 
 def make_capture(source, fbdev, display=":5", commands=()):
@@ -484,6 +585,7 @@ def main():
     )
     ap.add_argument("--run", action="append", default=[], metavar="CMD", help="with --source apps: start CMD on it")
     ap.add_argument("--display", default=":5", help="with --source apps: X display number for the apps screen")
+    ap.add_argument("--hotkey", default="ctrl+alt+k", help="with --source apps: toggles typing on the CYD")
     ap.add_argument("--fbdev", default="/dev/fb0")
     ap.add_argument("--fps", type=float, default=30, help="upper limit; the link usually caps it lower")
     ap.add_argument("--quality", type=int, default=70, help="JPEG quality 1-95")
@@ -494,6 +596,14 @@ def main():
     cap = make_capture(args.source, args.fbdev, args.display, args.run)
     if args.source == "apps":
         touch = AppsTouch(args.display)
+        try:
+            KeyboardForwarder(args.display, args.hotkey, cap)
+        except (PermissionError, ImportError):
+            print(
+                "keyboard: can't read keyboards, so typing on the CYD is off. Allow it with\n"
+                "  sudo usermod -aG input $USER\nthen log out and back in (python3-evdev must be installed).",
+                file=sys.stderr,
+            )
     else:
         touch = TouchPointer() if args.touch else None
 
@@ -508,7 +618,11 @@ def main():
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so a plain kill also cleans up
     try:
         main()
     except KeyboardInterrupt:
         pass
+    finally:
+        for proc in _children:
+            proc.terminate()

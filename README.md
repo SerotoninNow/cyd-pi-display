@@ -52,6 +52,11 @@ touch working as the mouse on that screen (your main pointer is unaffected). Eac
 is sized to fill the panel. `--run` can be given several times; to start more apps later,
 set `DISPLAY=:5` for them. Needs `sudo apt install xvfb`.
 
+To type into apps on the CYD, press Ctrl+Alt+K: the keyboard then goes to the CYD (shown by a
+blue frame around the panel) until you press it again. Change the combination with `--hotkey`.
+This reads keyboards directly, so your user must be in the `input` group (it is by default on
+Raspberry Pi OS; elsewhere `sudo usermod -aG input $USER`, then log out and back in).
+
 ### Mirroring
 
 Without `--source`, the main screen is mirrored. The capture method is chosen automatically:
