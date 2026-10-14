@@ -52,3 +52,26 @@ to `/dev/uinput`, simplest with `sudo`), `--stretch`, `--quality`, `--port`.
 - **Touch lands off-target**: adjust the `TOUCH_*_MIN/MAX` values in `firmware/src/main.cpp`.
 - **Readable text**: the panel is only 320x240, so set the Pi to a low resolution
   (640x480 scales down cleanly).
+
+## Using the CYD as a microSD card reader
+
+The CYD has a microSD slot, so with different firmware it can stand in for a card reader
+when you have none. It is slow (an OS image with desktop took about 6.5 hours) but every
+block is read back and checked after writing.
+
+```bash
+.venv/bin/pio run -d firmware -e sdcard2usb -t upload
+```
+
+Use `-e sdcard` for the single-USB board. Then, with the card in the CYD's slot:
+
+```bash
+python3 tools/cyd_sd.py info
+```
+
+That shows the card's partitions and whether the files a Pi 3 B needs to boot are present.
+`write IMAGE.img.xz` writes an OS image (erasing the card; `--start SECTOR` resumes an interrupted
+write), and `setup` sets the user, Wi-Fi and SSH on a Raspberry Pi OS (Trixie or later) card
+through cloud-init, asking for passwords in the terminal. Reflash the display firmware afterwards.
+
+The link runs at 1.5 Mbaud; faster settings corrupted data on the CH340 in testing.
