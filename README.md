@@ -58,7 +58,7 @@ This reads keyboards directly, so your user must be in the `input` group (it is 
 Raspberry Pi OS; elsewhere `sudo usermod -aG input $USER`, then log out and back in).
 
 For a Spotify "now playing" screen with touch controls, see
-[cyd-spotify](https://github.com/SerotoninNow/cyd-spotify); it uses the same firmware.
+[cyd-spotify-controller](https://github.com/SerotoninNow/cyd-spotify-controller); it uses the same firmware.
 
 ### Mirroring
 
