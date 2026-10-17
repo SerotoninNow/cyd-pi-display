@@ -14,7 +14,7 @@
 //       'R'  read         -> count*512 bytes, crc32
 //       'W'  write        <- count*512 bytes, crc32. Written, read back and compared.
 //       'D'  write deflated <- uint16 n, n bytes of zlib data, crc32 of the inflated data. As 'W'.
-//       'Z'  write zeros  count sectors, nothing transferred
+//       'Z'  write zeros  count sectors, nothing transferred. Read back and checked.
 //       'C'  checksum     -> crc32 of count sectors
 //       'T'  link test    <- count*512 bytes, crc32. Checked and discarded; the card is not touched.
 
@@ -221,10 +221,15 @@ static void handleCommand() {
       return replyOk();
 
     case 'Z':
-      memset(buf, 0, sizeof(buf));
       while (count) {
         uint16_t n = count < MAX_XFER ? count : MAX_XFER;
+        size_t len = (size_t)n * 512;
+        memset(buf, 0, len);
         if (disk_write(pdrv, buf, lba, n) != RES_OK) return replyErr(ERR_WRITE);
+        if (disk_read(pdrv, buf, lba, n) != RES_OK) return replyErr(ERR_READ);
+        for (size_t i = 0; i < len; i++) {
+          if (buf[i]) return replyErr(ERR_VERIFY);
+        }
         lba += n;
         count -= n;
       }

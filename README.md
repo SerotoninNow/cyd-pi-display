@@ -74,6 +74,17 @@ Without `--source`, the main screen is mirrored. The capture method is chosen au
 Useful options: `--touch` (CYD touchscreen moves and clicks the Pi pointer; needs write access
 to `/dev/uinput`, simplest with `sudo`), `--stretch`, `--quality`, `--port`.
 
+### As the Pi's display, from boot
+
+```bash
+sh pi/setup-autostart.sh
+```
+
+Run on the Pi, then reboot. The desktop then logs in automatically at 640x480 (even with no
+monitor attached; this scales exactly 2:1 onto the CYD) and is mirrored onto the CYD from boot,
+with the touchscreen as the mouse. The mirror restarts by itself if the CYD is unplugged.
+`sh pi/setup-autostart.sh remove` undoes it (desktop autologin is left on).
+
 ## Tuning
 
 - **Speed**: only the part of the screen that changed is sent, so small changes (a clock, a
@@ -89,8 +100,8 @@ to `/dev/uinput`, simplest with `sudo`), `--stretch`, `--quality`, `--port`.
 ## Using the CYD as a microSD card reader
 
 The CYD has a microSD slot, so with different firmware it can stand in for a card reader
-when you have none. It is slow (an OS image with desktop took about 6.5 hours) but every
-block is read back and checked after writing.
+when you have none. It is slow (an OS image with desktop took about 7.5 hours, plus 80 minutes
+to verify) but every block is read back and checked after writing.
 
 ```bash
 .venv/bin/pio run -d firmware -e sdcard2usb -t upload
@@ -103,8 +114,21 @@ python3 tools/cyd_sd.py info
 ```
 
 That shows the card's partitions and whether the files a Pi 3 B needs to boot are present.
-`write IMAGE.img.xz` writes an OS image (erasing the card; `--start SECTOR` resumes an interrupted
-write), and `setup` sets the user, Wi-Fi and SSH on a Raspberry Pi OS (Trixie or later) card
-through cloud-init, asking for passwords in the terminal. Reflash the display firmware afterwards.
+The other commands:
+
+- `check` tests a new card for fake capacity (counterfeit cards silently lose data past their
+  real size) by writing tagged spots across the whole card and reading them back. Erases the card.
+- `write IMAGE.img.xz` writes an OS image, erasing the card. `--start SECTOR` resumes an
+  interrupted write.
+- `verify IMAGE.img.xz` re-reads the whole card and compares it with the image, catching
+  anything that changed after it was written.
+- `setup` sets the user, Wi-Fi and SSH on a Raspberry Pi OS (Trixie or later) card through
+  cloud-init, asking for passwords in the terminal. It takes several networks, including
+  eduroam-style ones with a username, and also works on a card that has already booted
+  (keep the same username there, or the existing account is renamed).
+- `pull PATH...` copies files off the card's Linux partition, read-only, e.g. logs from a Pi
+  that won't come onto the network.
+
+Reflash the display firmware afterwards.
 
 The link runs at 1.5 Mbaud; faster settings corrupted data on the CH340 in testing.

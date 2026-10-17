@@ -2,8 +2,11 @@
 """Read and write the microSD card in a CYD running the SD bridge firmware.
 
     python3 tools/cyd_sd.py info                  # card details and a Raspberry Pi boot check
+    python3 tools/cyd_sd.py check                 # test a new card for fake capacity (erases it)
     python3 tools/cyd_sd.py write image.img.xz    # write an OS image (erases the card)
+    python3 tools/cyd_sd.py verify image.img.xz   # re-read the whole card and compare with the image
     python3 tools/cyd_sd.py setup                 # set the user, Wi-Fi and SSH on a Raspberry Pi OS card
+    python3 tools/cyd_sd.py pull /var/log/x.log   # copy a file off the card's Linux (ext4) partition
 
 See firmware/src/sdcard.cpp for the link protocol.
 """
@@ -14,6 +17,7 @@ import json
 import lzma
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import struct
@@ -247,6 +251,77 @@ def cmd_info(bridge, args):
         print("Verdict: the boot files a Pi 3 B needs are all present.")
 
 
+def confirm_erase(args):
+    if not args.yes and input("This ERASES the card. Type 'yes' to continue: ").strip() != "yes":
+        raise SystemExit("Nothing written.")
+
+
+def cmd_check(bridge, args):
+    """Counterfeit cards report more space than they have and silently wrap or drop writes past
+    the real size. Writes a tagged sector at spots across the whole card, then reads them all back."""
+    kind, sectors = bridge.info()
+    print(f"Card: {CARD_TYPES.get(kind, kind)}, {size_str(sectors)}")
+    confirm_erase(args)
+    spots = {(sectors - 1) * i // 255 for i in range(256)}
+    k = 11
+    while (1 << k) < sectors:  # fakes are usually a power of two in real size: probe either side
+        spots.update({(1 << k) - 1, 1 << k})
+        k += 1
+    spots = sorted(s for s in spots if s < sectors)
+    tag = os.urandom(8)
+
+    def pattern(lba):
+        return (tag + struct.pack("<Q", lba)) * 32
+
+    began = time.monotonic()
+    for i, lba in enumerate(spots):
+        bridge.write_all([(lba, pattern(lba))])
+        print(f"\rwriting test spots {i + 1}/{len(spots)}", end="", flush=True)
+    bad = []
+    for i, lba in enumerate(spots):
+        if bridge.read(lba) != pattern(lba):
+            bad.append(lba)
+        print(f"\rreading test spots back {i + 1}/{len(spots)}", end="", flush=True)
+    print()
+    if bad:
+        print(f"FAILED: {len(bad)} of {len(spots)} spots did not keep their data; the first bad one is at "
+              f"{size_str(bad[0])} into the card. This card is fake or faulty; don't use it.")
+        sys.exit(1)
+    print(f"Passed: all {len(spots)} spots across the full {size_str(sectors)} kept their data "
+          f"({time.monotonic() - began:.0f} s).")
+
+
+def open_image(path):
+    return lzma.open(path) if path.endswith(".xz") else open(path, "rb")
+
+
+def cmd_verify(bridge, args):
+    """Compares the card against the image in 4 MB regions using checksums worked out on the CYD,
+    so nothing but checksums crosses the USB link. Catches data that changed after it was written."""
+    kind, sectors = bridge.info()
+    region, lba, bad, began = 8192, 0, [], time.monotonic()
+    with open_image(args.image) as src:
+        while True:
+            data = src.read(region * 512)
+            if not data:
+                break
+            if len(data) % 512:
+                data += bytes(512 - len(data) % 512)
+            count = len(data) // 512
+            if bridge.checksum(lba, count) != zlib.crc32(data):
+                bad.append(lba)
+            lba += count
+            elapsed = time.monotonic() - began
+            print(f"\r{lba * 512 / 1e6:8.1f} MB checked, {elapsed / 60:5.1f} min, {len(bad)} mismatched ",
+                  end="", flush=True)
+    print()
+    if bad:
+        print(f"FAILED: {len(bad)} regions differ from the image, first at sector {bad[0]}. "
+              f"Rewrite from there with: write --start {bad[0]} {args.image}")
+        sys.exit(1)
+    print(f"Verified: the card matches the image ({lba * 512 / 1e9:.2f} GB).")
+
+
 def image_chunks(src, sectors, start):
     lba = 0
     while True:
@@ -265,9 +340,7 @@ def image_chunks(src, sectors, start):
 def cmd_write(bridge, args):
     kind, sectors = bridge.info()
     print(f"Card: {CARD_TYPES.get(kind, kind)}, {size_str(sectors)}")
-    if not args.yes:
-        if input("This ERASES the card. Type 'yes' to continue: ").strip() != "yes":
-            return
+    confirm_erase(args)
     began, sent = time.monotonic(), 0
 
     def progress(lba, nbytes):
@@ -282,8 +355,7 @@ def cmd_write(bridge, args):
             flush=True,
         )
 
-    src = lzma.open(args.image) if args.image.endswith(".xz") else open(args.image, "rb")
-    with src:
+    with open_image(args.image) as src:
         bridge.write_all(image_chunks(src, sectors, args.start), progress)
     print("\nDone: every block was read back from the card and matched.")
 
@@ -319,8 +391,47 @@ def ask_settings():
     s["hostname"] = ask(
         "Hostname", "raspberrypi", pattern=r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?", rule="Letters, digits and - only."
     )
-    s["ssid"] = ask("Wi-Fi network name")
-    s["wifi_password"] = ask("Wi-Fi password (hidden)", secret=True)
+
+    def ask_network(first):
+        n = {"ssid": ask("Wi-Fi network name" if first else "Next Wi-Fi network name")}
+        enterprise = ask(
+            "Does it need a username as well as a password, like eduroam? (y/n)",
+            "y" if n["ssid"].lower() == "eduroam" else "n",
+            pattern=r"[YyNn]",
+            rule="y or n.",
+        ).lower() == "y"
+        if enterprise:
+            n["identity"] = ask("Wi-Fi username (for eduroam, usually your full university email)")
+            realm = n["identity"].split("@", 1)[1] if "@" in n["identity"] else None
+            print("Note: this password sits on the card in plain text until the Pi's first boot, which removes it.")
+            n["wifi_password"] = ask("Wi-Fi password (hidden)", secret=True)
+            n["eap"] = ask("Sign-in method, peap or ttls", "peap", pattern=r"(?i)peap|ttls", rule="peap or ttls.").lower()
+            n["phase2"] = ask(
+                "Inner method", "mschapv2" if n["eap"] == "peap" else "pap",
+                pattern=r"(?i)mschapv2|pap|gtc|md5", rule="mschapv2, pap, gtc or md5.",
+            ).lower()
+            n["anonymous"] = ask("Outer (anonymous) identity, or - for none", f"anonymous@{realm}" if realm else "-")
+            while True:
+                path = ask("Your institution's CA certificate (.pem file), or - to skip", "-")
+                if path == "-":
+                    break
+                try:
+                    with open(os.path.expanduser(path)) as f:
+                        pem = f.read()
+                except OSError as err:
+                    print(f"Can't read it: {err}")
+                    continue
+                if "-----BEGIN CERTIFICATE-----" in pem:
+                    n["ca"] = pem
+                    break
+                print("That isn't a PEM certificate (it should contain -----BEGIN CERTIFICATE-----).")
+        else:
+            n["wifi_password"] = ask("Wi-Fi password (hidden)", secret=True)
+        return n
+
+    s["networks"] = [ask_network(True)]
+    while ask("Add another Wi-Fi network the Pi should also use? (y/n)", "n", pattern=r"[YyNn]", rule="y or n.").lower() == "y":
+        s["networks"].append(ask_network(False))
     s["country"] = ask("Wi-Fi country code, two letters (US, GB, DE...)", pattern=r"[A-Za-z]{2}", rule="Two letters.").upper()
     try:
         zone = os.path.realpath("/etc/localtime").split("/zoneinfo/")[1]
@@ -336,7 +447,33 @@ def cloud_init_files(s):
     crypted = subprocess.run(
         ["openssl", "passwd", "-6", "-stdin"], input=s["password"] + "\n", text=True, capture_output=True, check=True
     ).stdout.strip()
-    psk = hashlib.pbkdf2_hmac("sha1", s["wifi_password"].encode(), s["ssid"].encode(), 4096, 32).hex()
+    access_points, extra_cmds, nm_cmds, ca_files = "", "", "", {}
+    for i, n in enumerate(s["networks"]):
+        if n.get("identity"):  # WPA2-Enterprise (eduroam and the like)
+            auth = [("key-management", "eap"), ("method", n["eap"]), ("identity", n["identity"]),
+                    ("password", n["wifi_password"]), ("phase2-auth", n["phase2"])]
+            if n["anonymous"] != "-":
+                auth.append(("anonymous-identity", n["anonymous"]))
+            if n.get("ca"):
+                name = f"wifi-ca{i or ''}.pem"
+                ca_files[name] = n["ca"]
+                auth.append(("ca-certificate", f"/boot/firmware/{name}"))
+            entry = "          auth:\n" + "".join(f"            {k}: {q(v)}\n" for k, v in auth)
+            # By runcmd the password is in root-only system files, so drop the copy anyone could read off the card.
+            scrub = r's/^\( *password:\).*/\1 "removed after first boot"/'
+            extra_cmds = f"- [ sed, -i, {q(scrub)}, /boot/firmware/network-config ]\n"
+        else:
+            psk = hashlib.pbkdf2_hmac("sha1", n["wifi_password"].encode(), n["ssid"].encode(), 4096, 32).hex()
+            entry = f"          password: {q(psk)}\n"
+            # network-config alone is ignored on a card that has booted before (an earlier connection
+            # already owns wlan0 there), so also add the network directly, preferred over the others.
+            ssid = shlex.quote(n["ssid"])
+            nm = (f"nmcli connection delete id {ssid} 2>/dev/null; "
+                  f"nmcli connection add type wifi ifname wlan0 con-name {ssid} ssid {ssid} "
+                  f"wifi-sec.key-mgmt wpa-psk wifi-sec.psk {psk} connection.autoconnect-priority {10 - i}; "
+                  f"nmcli --wait 20 connection up id {ssid} || true")
+            nm_cmds += f"- [ sh, -c, {q(nm)} ]\n"
+        access_points += f"        {q(n['ssid'])}:\n{entry}"
     user_data = f"""#cloud-config
 hostname: {q(s["hostname"])}
 manage_etc_hosts: true
@@ -353,7 +490,7 @@ runcmd:
 - [ rfkill, unblock, wifi ]
 - [ raspi-config, nonint, do_wifi_country, {q(s["country"])} ]
 - [ systemctl, enable, --now, ssh ]
-"""
+{nm_cmds}{extra_cmds}"""
     network_config = f"""network:
   version: 2
   wifis:
@@ -362,12 +499,12 @@ runcmd:
       optional: true
       regulatory-domain: {q(s["country"])}
       access-points:
-        {q(s["ssid"])}:
-          password: {q(psk)}
-"""
+{access_points}"""
     # A new instance id makes cloud-init apply the settings even if the card has already been booted.
-    meta_data = f"dsmode: local\ninstance_id: cyd-setup-{int(time.time())}\n"
-    return {"user-data": user_data, "network-config": network_config, "meta-data": meta_data, "ssh": ""}
+    meta_data = f"dsmode: local\ninstance-id: cyd-setup-{int(time.time())}\n"
+    files = {"user-data": user_data, "network-config": network_config, "meta-data": meta_data, "ssh": ""}
+    files.update(ca_files)
+    return files
 
 
 def load_boot_volume(bridge, path):
@@ -445,6 +582,143 @@ def cmd_setup(bridge, args):
         print(f"Done: {', '.join(files)} written to the card's boot partition and verified.")
 
 
+class Ext4:
+    """Just enough of ext4 to read files, so logs can be copied off a card without Linux mounting it."""
+
+    def __init__(self, read, start):
+        self.read_sectors, self.start = read, start
+        sb = read(start + 2, 2)
+        if struct.unpack_from("<H", sb, 0x38)[0] != 0xEF53:
+            raise SystemExit("No ext4 filesystem there.")
+        self.bs = 1024 << struct.unpack_from("<I", sb, 24)[0]
+        self.inodes_per_group = struct.unpack_from("<I", sb, 40)[0]
+        self.inode_size = struct.unpack_from("<H", sb, 88)[0]
+        first_data_block = struct.unpack_from("<I", sb, 20)[0]
+        is64 = struct.unpack_from("<I", sb, 0x60)[0] & 0x80
+        self.desc_size = struct.unpack_from("<H", sb, 0xFE)[0] if is64 else 32
+        self.desc_block = first_data_block + 1
+        self.is64 = is64
+
+    def block(self, n, count=1):
+        spb = self.bs // 512
+        return self.read_sectors(self.start + n * spb, count * spb)
+
+    def inode(self, num):
+        group, index = divmod(num - 1, self.inodes_per_group)
+        off = group * self.desc_size
+        desc = self.block(self.desc_block + off // self.bs)[off % self.bs :]
+        table = struct.unpack_from("<I", desc, 8)[0]
+        if self.is64 and self.desc_size >= 64:
+            table |= struct.unpack_from("<I", desc, 0x28)[0] << 32
+        byte = index * self.inode_size
+        return self.block(table + byte // self.bs)[byte % self.bs :][: self.inode_size]
+
+    def _extents(self, node):
+        magic, entries, _, depth = struct.unpack_from("<HHHH", node, 0)
+        if magic != 0xF30A:
+            raise IOError("damaged extent tree")
+        for i in range(entries):
+            e = node[12 + i * 12 : 24 + i * 12]
+            if depth == 0:
+                lblock, length, hi, lo = struct.unpack("<IHHI", e)
+                yield lblock, (hi << 32) | lo, length & 0x7FFF  # lengths over 32768 mark unwritten space
+            else:
+                lblock, lo, hi = struct.unpack_from("<IIH", e)
+                yield from self._extents(self.block((hi << 32) | lo))
+
+    def file_data(self, num):
+        ino = self.inode(num)
+        size = struct.unpack_from("<I", ino, 4)[0] | struct.unpack_from("<I", ino, 108)[0] << 32
+        flags = struct.unpack_from("<I", ino, 32)[0]
+        if flags & 0x10000000:  # inline data
+            return ino[40:100][:size]
+        if not flags & 0x80000:
+            raise IOError("old-style (non-extent) file; not supported")
+        out = bytearray(size)
+        for lblock, pblock, length in self._extents(ino[40:100]):
+            pos = lblock * self.bs
+            if pos >= size:
+                continue
+            want = min(length, -(-(size - pos) // self.bs))
+            data = self.block(pblock, want)
+            out[pos : pos + len(data)] = data[: size - pos]
+        return bytes(out)
+
+    def _entry(self, dir_num, name):
+        data, pos = self.file_data(dir_num), 0
+        while pos + 8 <= len(data):
+            ino, rec_len, name_len = struct.unpack_from("<IHB", data, pos)
+            if rec_len < 8:
+                break
+            if ino and data[pos + 8 : pos + 8 + name_len].decode(errors="replace") == name:
+                return ino
+            pos += rec_len
+        return None
+
+    def lookup(self, path, hops=0):
+        """Inode number for path, following symbolic links."""
+        parts, done, num = [p for p in path.split("/") if p], [], 2  # 2 = root directory
+        while parts:
+            part = parts.pop(0)
+            if part == "..":
+                done = done[:-1]
+                num = self.lookup("/" + "/".join(done), hops)
+                continue
+            found = self._entry(num, part)
+            if not found:
+                raise FileNotFoundError(path)
+            ino = self.inode(found)
+            if struct.unpack_from("<H", ino, 0)[0] & 0xF000 == 0xA000:  # symlink
+                if hops > 20:
+                    raise IOError(f"{path}: too many symlinks")
+                size = struct.unpack_from("<I", ino, 4)[0]
+                fast = size < 60 and not struct.unpack_from("<I", ino, 32)[0] & 0x80000
+                target = (ino[40 : 40 + size] if fast else self.file_data(found)).decode(errors="replace")
+                base = "" if target.startswith("/") else "/" + "/".join(done)
+                return self.lookup(base + "/" + target + "/" + "/".join(parts), hops + 1)
+            done.append(part)
+            num = found
+        return num
+
+    def listdir(self, path):
+        data, pos, names = self.file_data(self.lookup(path)), 0, []
+        while pos + 8 <= len(data):
+            ino, rec_len, name_len = struct.unpack_from("<IHB", data, pos)
+            if rec_len < 8:
+                break
+            if ino:
+                names.append(data[pos + 8 : pos + 8 + name_len].decode(errors="replace"))
+            pos += rec_len
+        return [n for n in names if n not in (".", "..")]
+
+
+def linux_partition(bridge):
+    mbr = bridge.read(0)
+    for i in range(4):
+        ptype, start = mbr[450 + i * 16], struct.unpack_from("<I", mbr, 454 + i * 16)[0]
+        if ptype == 0x83:
+            return Ext4(bridge.read, start)
+    raise SystemExit("The card has no Linux partition.")
+
+
+def cmd_pull(bridge, args):
+    bridge.info()
+    fs = linux_partition(bridge)
+    for path in args.paths:
+        try:
+            if args.list:
+                print(f"{path}:", "  ".join(sorted(fs.listdir(path))))
+                continue
+            data = fs.file_data(fs.lookup(path))
+        except (FileNotFoundError, IOError) as err:
+            print(f"{path}: {err}")
+            continue
+        dest = os.path.join(args.dest, path.strip("/").replace("/", "_"))
+        with open(dest, "wb") as f:
+            f.write(data)
+        print(f"{path}: {len(data)} bytes -> {dest}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", default="/dev/ttyUSB0")
@@ -453,6 +727,12 @@ def main():
     p = sub.add_parser("info", help="show card details and check Raspberry Pi boot files")
     p.add_argument("--list", action="store_true", help="list every file in the boot partition's root")
     p.set_defaults(func=cmd_info)
+    p = sub.add_parser("check", help="test the card for fake capacity (erases it)")
+    p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p.set_defaults(func=cmd_check)
+    p = sub.add_parser("verify", help="re-read the whole card and compare it with an image")
+    p.add_argument("image")
+    p.set_defaults(func=cmd_verify)
     p = sub.add_parser("write", help="write an .img or .img.xz to the card, erasing it")
     p.add_argument("image")
     p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
@@ -460,6 +740,11 @@ def main():
     p.set_defaults(func=cmd_write)
     p = sub.add_parser("setup", help="set the user, Wi-Fi and SSH on a card holding Raspberry Pi OS (Trixie or later)")
     p.set_defaults(func=cmd_setup)
+    p = sub.add_parser("pull", help="copy files off the card's Linux partition (read-only)")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--dest", default=".", help="folder to save into")
+    p.add_argument("--list", action="store_true", help="list folders instead of copying files")
+    p.set_defaults(func=cmd_pull)
     args = ap.parse_args()
 
     try:
